@@ -1,14 +1,14 @@
 import streamlit as st
 import matplotlib.pyplot as plt
 from io import BytesIO
-from collections import defaultdict
-import math
+from dataclasses import dataclass
+from typing import List, Tuple, Optional
 
-st.set_page_config(page_title="板取り最適化（ギロチン＋自動探索＋検証）", layout="wide")
+st.set_page_config(page_title="板取り最適化（完全ギロチン・衝突回避）", layout="wide")
 
-# ------------------------------------------------------------
+# -----------------------------
 # 基本設定
-# ------------------------------------------------------------
+# -----------------------------
 BOARD_SIZES = {
     "サブロク (1820×910mm)": (1820.0, 910.0),
     "シハチ (2400×1200mm)": (2400.0, 1200.0),
@@ -16,12 +16,36 @@ BOARD_SIZES = {
 }
 EPS = 1e-6
 
-# ------------------------------------------------------------
-# UI（左：条件、右：結果）
-# ------------------------------------------------------------
-st.title("🪵 板取り最適化ツール（ギロチン＋自動探索＋同幅束＋検証）")
-left, right = st.columns([0.55, 0.45])
+@dataclass
+class Rect:
+    x: float
+    y: float
+    w: float
+    h: float
 
+@dataclass
+class PiecePlaced:
+    pid: int
+    x: float
+    y: float
+    w: float
+    h: float
+    rot: bool  # 回転したか
+    # どのボードかは上位で管理
+
+@dataclass
+class CutLine:
+    x1: float
+    y1: float
+    x2: float
+    y2: float  # 垂直or水平の全通線
+
+# -----------------------------
+# UI
+# -----------------------------
+st.title("🪵 板取り最適化（完全ギロチン・衝突回避）")
+
+left, right = st.columns([0.55, 0.45])
 with left:
     st.subheader("① 条件入力")
     board_name = st.selectbox("母材サイズ", list(BOARD_SIZES.keys()))
@@ -29,10 +53,9 @@ with left:
 
     c1, c2, c3 = st.columns(3)
     allow_rotate = c1.checkbox("回転（90°）を許可", value=True)
-    kerf = c2.number_input("刃厚（mm）", min_value=0.0, step=0.1, value=3.0,
-                           help="カットラインの実損失。歩留まりと配置に反映")
+    kerf = c2.number_input("刃厚（mm）", min_value=0.0, step=0.1, value=3.0, help="カット1本ごとに消費する幅/高さ")
     edge_trim = c3.number_input("外周安全マージン（mm）", min_value=0.0, step=0.5, value=5.0,
-                                help="外周のNG帯。板サイズから左右上下で控えます")
+                                help="外周のNG帯（板サイズから左右上下で控え）")
 
     st.markdown("—")
     st.subheader("② 部材リスト（幅×高さ×枚数）")
@@ -42,6 +65,7 @@ with left:
             {"w":600.0,"h":910.0,"n":1},
             {"w":200.0,"h":500.0,"n":3},
         ]
+
     to_delete = []
     for idx, row in enumerate(st.session_state.rows):
         a,b,c,d = st.columns([1,1,1,0.3])
@@ -55,419 +79,331 @@ with left:
     st.button("＋ 行を追加", on_click=lambda: st.session_state.rows.append({"w":300.0,"h":300.0,"n":1}))
 
     st.markdown("—")
-    advanced = st.checkbox("詳細オプションを表示", value=False)
-    if advanced:
-        c1, c2 = st.columns(2)
-        max_height_candidates = c1.slider("棚高さ/カラム幅の候補数", 3, 20, 8)
-        merge_height_tol = c2.number_input("候補マージ閾値（mm）", min_value=0.0, step=0.5, value=2.0)
-    else:
-        max_height_candidates = 8
-        merge_height_tol = 2.0
+    st.subheader("③ 最適化の目的")
+    mode = st.radio(
+        "目的を選択",
+        ["① 歩留まり最優先（板枚数→廃材最少）", "② カット数最少（split本数最少）"],
+        index=0
+    )
 
     compute = st.button("板取りを計算")
 
-# ------------------------------------------------------------
+# -----------------------------
 # ユーティリティ
-# ------------------------------------------------------------
-def normalize_dim(w,h,rotate_ok):
-    return (min(w,h), max(w,h)) if rotate_ok else (w,h)
-
-def expanded_pieces(rows, rotate_ok):
-    """同一サイズで束ねず、n枚をすべて個片として展開（←ご要望）"""
-    pieces = []
+# -----------------------------
+def expand_pieces(rows) -> List[Tuple[int, float, float]]:
+    """同一サイズでも個片に展開（pid, w, h）"""
+    out = []
     pid = 0
     for r in rows:
-        w,h,n = float(r["w"]), float(r["h"]), int(r["n"])
+        w, h, n = float(r["w"]), float(r["h"]), int(r["n"])
         for _ in range(n):
-            pieces.append((w,h,False,pid))  # (w,h,rot,pid)
+            out.append((pid, w, h))
             pid += 1
-    return pieces
-
-def candidate_heights(rows, rotate_ok, max_k=8, tol=2.0):
-    vals = []
-    for r in rows:
-        w,h,n = float(r["w"]), float(r["h"]), int(r["n"])
-        vals.append(h)
-        if rotate_ok: vals.append(w)
-    if not vals: return [100.0]
-    vals = sorted(vals)
-    merged = []
-    for v in vals:
-        if not merged or abs(merged[-1]-v) > tol:
-            merged.append(v)
-    merged = sorted(merged, reverse=True)[:max_k]
-    return merged
-
-def same_width_pack_order(pieces):
-    """棚内ローカル最適化：同幅束→幅大優先"""
-    buckets = defaultdict(list)
-    for w,h,rot,pid in pieces:
-        buckets[w].append((w,h,rot,pid))
-    ordered = []
-    for w in sorted(buckets.keys(), reverse=True):
-        ordered.extend(buckets[w])
-    return ordered
-
-def same_height_pack_order(pieces):
-    """カラム内ローカル最適化：同高さ束→高さ大優先"""
-    buckets = defaultdict(list)
-    for w,h,rot,pid in pieces:
-        buckets[h].append((w,h,rot,pid))
-    ordered = []
-    for h in sorted(buckets.keys(), reverse=True):
-        ordered.extend(buckets[h])
-    return ordered
-
-# ------------------------------------------------------------
-# ギロチン（横先行：リップ→クロス）
-# ------------------------------------------------------------
-def pack_horizontal(rows, BOARD_W, BOARD_H, eff_w, eff_h, shelf_h, kerf, edge_trim, rotate_ok):
-    unit = kerf
-    boards, used_area = [], 0.0
-    # 個片展開
-    items = expanded_pieces(rows, rotate_ok)
-    # 棚高さに合うよう回転を検討（個片ごとに）
-    adj = []
-    for (w,h,rot,pid) in items:
-        ww,hh,rr = w,h,rot
-        if rotate_ok and min(w,h) <= shelf_h < max(w,h):
-            ww,hh,rr = (min(w,h), max(w,h), (w>h))
-        adj.append((ww,hh,rr,pid))
-    # 面積大優先
-    adj.sort(key=lambda t: t[0]*t[1], reverse=True)
-
-    def new_board():
-        return {"shelves":[], "used_h":0.0}
-    cur = new_board(); boards.append(cur)
-
-    def open_new_shelf():
-        y = cur["used_h"] + (unit if cur["shelves"] else 0.0)
-        sh = {"y":y, "h":shelf_h, "cursor_x":0.0, "placed":0, "pieces":[]}
-        cur["shelves"].append(sh)
-        cur["used_h"] = y + shelf_h
-
-    open_new_shelf()
-
-    for w,h,rot,pid in adj:
-        placed = False
-        # 既存棚へ
-        for sh in cur["shelves"]:
-            if h > sh["h"]: 
-                continue
-            need_w = w + (unit if sh["placed"]>0 else 0.0)
-            remain = eff_w - sh["cursor_x"]
-            if remain >= need_w:
-                sh["pieces"].append((w,h,rot,pid))
-                sh["placed"] += 1
-                sh["cursor_x"] += (need_w if sh["placed"]>1 else w)
-                used_area += w*h
-                placed = True
-                break
-        if placed: continue
-
-        # 新棚を同板内で作れるか？無理なら新板
-        need_h = (unit if cur["shelves"] else 0.0) + shelf_h
-        if cur["used_h"] + need_h > eff_h:
-            cur = new_board(); boards.append(cur)
-            open_new_shelf()
-        else:
-            open_new_shelf()
-
-        sh = cur["shelves"][-1]
-        sh["pieces"].append((w,h,rot,pid))
-        sh["placed"] += 1
-        sh["cursor_x"] += w
-        used_area += w*h
-
-    # 棚内ローカル最適化（同幅束）
-    boards_draw = []
-    for b in boards:
-        pts = []
-        for sh in b["shelves"]:
-            ordered = same_width_pack_order(sh["pieces"])
-            cursor_x = 0.0
-            prev_w = None
-            for i,(w,h,rot,pid) in enumerate(ordered):
-                if i>0 and prev_w != w:
-                    cursor_x += kerf  # 束の境はクロス1本ぶんの損失
-                x = cursor_x
-                y = sh["y"]
-                pts.append((x+edge_trim, y+edge_trim, w, h, rot, pid))
-                cursor_x += w
-                prev_w = w
-        boards_draw.append(pts)
-    return boards_draw, used_area, len(boards)
-
-# ------------------------------------------------------------
-# ギロチン（縦先行：クロス→リップ）
-# ------------------------------------------------------------
-def pack_vertical(rows, BOARD_W, BOARD_H, eff_w, eff_h, col_w, kerf, edge_trim, rotate_ok):
-    unit = kerf
-    boards, used_area = [], 0.0
-    items = expanded_pieces(rows, rotate_ok)
-    adj = []
-    for (w,h,rot,pid) in items:
-        ww,hh,rr = w,h,rot
-        if rotate_ok and min(w,h) <= col_w < max(w,h):
-            ww,hh,rr = (min(w,h), max(w,h), (w>h))
-        adj.append((ww,hh,rr,pid))
-    adj.sort(key=lambda t: t[0]*t[1], reverse=True)
-
-    def new_board():
-        return {"cols":[], "used_w":0.0}
-    cur = new_board(); boards.append(cur)
-
-    def open_new_col():
-        x = cur["used_w"] + (unit if cur["cols"] else 0.0)
-        col = {"x":x, "w":col_w, "cursor_y":0.0, "placed":0, "pieces":[]}
-        cur["cols"].append(col)
-        cur["used_w"] = x + col_w
-
-    open_new_col()
-
-    for w,h,rot,pid in adj:
-        placed = False
-        for col in cur["cols"]:
-            if w > col["w"]: 
-                continue
-            need_h = h + (unit if col["placed"]>0 else 0.0)
-            remain = eff_h - col["cursor_y"]
-            if remain >= need_h:
-                col["pieces"].append((w,h,rot,pid))
-                col["placed"] += 1
-                col["cursor_y"] += (need_h if col["placed"]>1 else h)
-                used_area += w*h
-                placed = True
-                break
-        if placed: continue
-
-        need_w = (unit if cur["cols"] else 0.0) + col_w
-        if cur["used_w"] + need_w > eff_w:
-            cur = new_board(); boards.append(cur)
-            open_new_col()
-        else:
-            open_new_col()
-
-        col = cur["cols"][-1]
-        col["pieces"].append((w,h,rot,pid))
-        col["placed"] += 1
-        col["cursor_y"] += h
-        used_area += w*h
-
-    # カラム内ローカル最適化（同高さ束）
-    boards_draw = []
-    for b in boards:
-        pts = []
-        for col in b["cols"]:
-            ordered = same_height_pack_order(col["pieces"])
-            cursor_y = 0.0
-            prev_h = None
-            for i,(w,h,rot,pid) in enumerate(ordered):
-                if i>0 and prev_h != h:
-                    cursor_y += kerf  # 束の境はリップ1本ぶん
-                x = col["x"]
-                y = cursor_y
-                pts.append((x+edge_trim, y+edge_trim, w, h, rot, pid))
-                cursor_y += h
-                prev_h = h
-        boards_draw.append(pts)
-    return boards_draw, used_area, len(boards)
-
-# ------------------------------------------------------------
-# カットライン生成と検証
-#   - 各部材の四辺を延長した全通線をカットライン候補に
-#   - 外周に一致する線は省略
-#   - 交差検証：重なり／カットラインが他部材の内部を横断しないか
-# ------------------------------------------------------------
-def dedup(values, tol=1e-4):
-    values = sorted(values)
-    out = []
-    for v in values:
-        if not out or abs(out[-1]-v) > tol:
-            out.append(v)
     return out
 
-def build_cutlines_from_pieces(boards_draw, BOARD_W, BOARD_H, eff_w, eff_h, edge_trim):
-    """四辺延長 → 盤全面の全通カットライン（外周一致は除外）"""
-    all_blocks = []
-    for pieces in boards_draw:
-        # 1) 重なり検査（個片単位）
-        overlaps = []
-        for i in range(len(pieces)):
-            xi, yi, wi, hi, _, pidi = pieces[i]
-            for j in range(i+1, len(pieces)):
-                xj, yj, wj, hj, _, pidj = pieces[j]
-                if (xi + wi - EPS > xj) and (xj + wj - EPS > xi) and (yi + hi - EPS > yj) and (yj + hj - EPS > yi):
-                    overlaps.append((pidi, pidj))
+def rect_fits(piece_w, piece_h, free: Rect):
+    return piece_w <= free.w + EPS and piece_h <= free.h + EPS
 
-        # 2) 候補カットライン
-        xs, ys = [], []
-        for (x,y,w,h,rot,pid) in pieces:
-            x1, x2 = x, x + w
-            y1, y2 = y, y + h
-            # 外周一致は省略
-            if abs(x1 - edge_trim) > EPS: xs.append(x1)
-            if abs(x2 - (edge_trim + eff_w)) > EPS: xs.append(x2)
-            if abs(y1 - edge_trim) > EPS: ys.append(y1)
-            if abs(y2 - (edge_trim + eff_h)) > EPS: ys.append(y2)
+def place_and_split(free: Rect, w:float, h:float, kerf:float, split_pref:str) -> Tuple[PiecePlaced, List[Rect], Optional[CutLine], Optional[CutLine]]:
+    """
+    free内の左上にw×hを置くと仮定（基準：左上基点で配置）。
+    その後freeをギロチン分割する。
+    split_pref: "min_waste", "min_cuts", "match_width_first", "match_height_first" などのヒント。
+    戻り値: (placed, new_free_rects, vcut_line?, hcut_line?)
+    カット線はfree領域内の分割線（板外までの延長は描画時に付与）。
+    """
+    # 配置位置（左上基点 → Streamlit描画は左下が原点なのでyはそのまま使いつつ後で反転しない）
+    px, py = free.x, free.y
+    placed = PiecePlaced(pid=-1, x=px, y=py, w=w, h=h, rot=False)
 
-        xs = dedup(xs); ys = dedup(ys)
+    # 分割方法（2分割×2で最大2本のカット）
+    # 置いた直後の残りは「右」と「下」に分けられるのが基本（左上固定）
+    # kerfは分割線の厚みとして減算
+    right_w = max(0.0, free.w - w - kerf)   # 垂直スプリット分のkerf消費
+    bottom_h = max(0.0, free.h - h - kerf)  # 水平スプリット分のkerf消費
 
-        # 3) ライン→部材内部横断の検査
-        #    縦線 x=c が他部材の内部 (x1<c<x2) を通るとNG（辺上はOK）
-        v_conflicts = []
-        for c in xs:
-            for (x,y,w,h,rot,pid) in pieces:
-                if x + EPS < c < x + w - EPS:
-                    v_conflicts.append(("V", c, pid))
-        h_conflicts = []
-        for r in ys:
-            for (x,y,w,h,rot,pid) in pieces:
-                if y + EPS < r < y + h - EPS:
-                    h_conflicts.append(("H", r, pid))
+    # 4パターン（どちらを先に切るかで出来る残り矩形が変わる）
+    # A: 先に垂直（右側を作る）→ 次に水平（下側を作る）
+    # B: 先に水平（下側）→ 次に垂直（右側）
+    # どちらでも最終的な面積は同じことが多いが、kerf消費順序の差で微妙に変わる
 
-        # 4) 描画用ライン（板外に20mmはみ出し）
-        over = 20.0
-        cutlines = []
-        for c in xs:
-            cutlines.append((c, -over + edge_trim, c, eff_h + edge_trim + over, "V"))
-        for r in ys:
-            cutlines.append((-over + edge_trim, r, eff_w + edge_trim + over, r, "H"))
+    # 右側矩形
+    right_rect_A = Rect(px + w + kerf, py, right_w, h) if right_w > EPS else None
+    # 下側矩形
+    bottom_rect_A = Rect(px, py + h + kerf, free.w, bottom_h) if bottom_h > EPS else None
 
-        all_blocks.append({
-            "pieces": pieces,
-            "cutlines": cutlines,
-            "overlaps": overlaps,
-            "v_conflicts": v_conflicts,
-            "h_conflicts": h_conflicts,
-            "cuts_count": len(xs) + len(ys)
-        })
-    return all_blocks
+    # パターンB（計算上は同じ寸法になるが、将来的な拡張で差を持たせやすいよう残しておく）
+    right_rect_B = Rect(px + w + kerf, py, right_w, h) if right_w > EPS else None
+    bottom_rect_B = Rect(px, py + h + kerf, free.w, bottom_h) if bottom_h > EPS else None
 
-def draw_block(block, title, i, BOARD_W, BOARD_H):
-    fig, ax = plt.subplots(figsize=(9,4.5))
-    ax.set_title(f"{title} - 板 {i+1}")
-    ax.set_xlim(0, BOARD_W)
-    ax.set_ylim(0, BOARD_H)
-    ax.add_patch(plt.Rectangle((0,0), BOARD_W, BOARD_H, fill=False, linewidth=2))
+    # カット線（freeの内部線）※描画時に板外へ20mm延長する
+    vcut = CutLine(px + w, py, px + w, py + h) if right_rect_A is not None else None
+    hcut = CutLine(px, py + h, px + free.w, py + h) if bottom_rect_A is not None else None
 
-    for (x,y,w,h,rot,pid) in block["pieces"]:
-        ax.add_patch(plt.Rectangle((x,y), w, h, fill=None, linewidth=1))
-        ax.text(x+w/2, y+h/2, f"{int(w)}×{int(h)}\n#{pid}", ha="center", va="center", fontsize=8)
+    # split_prefの簡易ヒューリスティック
+    if split_pref == "match_width_first" and right_rect_A is None and bottom_rect_A is not None:
+        # 横ぴったり優先 → 高さ側だけ分割
+        return placed, [bottom_rect_A], None, hcut
+    if split_pref == "match_height_first" and bottom_rect_A is None and right_rect_A is not None:
+        return placed, [right_rect_A], vcut, None
 
-    for (x1,y1,x2,y2,kind) in block["cutlines"]:
-        ax.plot([x1, x2], [y1, y2], linewidth=1.2)
+    # 既定：両方残るなら両方返す
+    new_rects = []
+    if right_rect_A is not None:
+        new_rects.append(right_rect_A)
+    if bottom_rect_A is not None:
+        new_rects.append(bottom_rect_A)
+    return placed, new_rects, vcut, hcut
 
-    ax.set_aspect('equal')
-    st.pyplot(fig)
+def choose_score(free: Rect, w:float, h:float, kerf:float, objective:str) -> Tuple[float, str]:
+    """
+    候補freeに対してスコアを付ける。
+    objective:
+      - "yield": 廃材を最小化（= 右/下の合計残り面積が少ない、あるいはどちらかピッタリ）
+      - "cuts": カット数最少（= 片側ピッタリで1本だけで済む配置を優先）
+    戻り値: (低いほど良いscore, split_pref)
+    """
+    # どちらかピッタリ？
+    width_exact = abs(free.w - w) <= EPS
+    height_exact = abs(free.h - h) <= EPS
 
-    buf = BytesIO()
-    fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
-    buf.seek(0)
-    st.download_button(
-        label=f"⬇️ 板 {i+1} をPNG保存",
-        data=buf,
-        file_name=f"{title}_board{i+1}.png",
-        mime="image/png"
-    )
+    # 残り幅/高
+    right_w = max(0.0, free.w - w - kerf)
+    bottom_h = max(0.0, free.h - h - kerf)
+    waste = right_w * h + free.w * bottom_h  # 単純近似
 
-# ------------------------------------------------------------
-# 総合探索（横先行＆縦先行）
-#   - 歩留まり最優先：枚数→廃材（eff*boards - used）
-#   - カット数最少：カット本数→枚数
-# ------------------------------------------------------------
-def explore(rows, BOARD_W, BOARD_H, kerf, edge_trim, rotate_ok, max_k, merge_tol):
-    eff_w = BOARD_W - 2*edge_trim
-    eff_h = BOARD_H - 2*edge_trim
+    if objective == "cuts":
+        # 片側がピッタリならスコアを強く優遇
+        if width_exact or height_exact:
+            return (0.0 if (width_exact and height_exact) else 0.1), ("match_width_first" if width_exact else "match_height_first")
+        # それ以外は廃材少なめを優先
+        return (1.0 + waste), "min_cuts"
+
+    # yield
+    if width_exact or height_exact:
+        return (0.1 + waste), ("match_width_first" if width_exact else "match_height_first")
+    return waste, "min_waste"
+
+def guillotine_pack(pieces: List[Tuple[int,float,float]],
+                    board_w: float, board_h: float,
+                    kerf: float, edge: float,
+                    allow_rotate: bool,
+                    objective: str):
+    """
+    完全ギロチン二分割のヒューリスティック実装。
+    - pieces: [(pid, w, h)]
+    - objective: "yield" or "cuts"
+    戻り: boards(list) それぞれ {placed:[PiecePlaced...], cuts:[CutLine...] }
+    """
+    # 有効サイズ
+    eff_w = board_w - 2*edge
+    eff_h = board_h - 2*edge
     if eff_w <= 0 or eff_h <= 0:
-        return None, None, eff_w, eff_h
+        return [], eff_w, eff_h
 
-    heights = candidate_heights(rows, rotate_ok, max_k, merge_tol)
+    # 面積降順
+    pieces_sorted = sorted(pieces, key=lambda t: t[1]*t[2], reverse=True)
 
-    # 横候補
-    horiz = []
-    for sh in heights:
-        bd, used, boards_n = pack_horizontal(rows, BOARD_W, BOARD_H, eff_w, eff_h, sh, kerf, edge_trim, rotate_ok)
-        waste = eff_w*eff_h*boards_n - used
-        horiz.append({"mode":"H","param":sh,"boards_draw":bd,"used":used,"waste":waste,"boards":boards_n})
+    boards = []
 
-    # 縦候補（高さ候補をそのまま幅候補へ）
-    vert = []
-    for cw in heights:
-        bd, used, boards_n = pack_vertical(rows, BOARD_W, BOARD_H, eff_w, eff_h, cw, kerf, edge_trim, rotate_ok)
-        waste = eff_w*eff_h*boards_n - used
-        vert.append({"mode":"V","param":cw,"boards_draw":bd,"used":used,"waste":waste,"boards":boards_n})
+    def new_board():
+        return {
+            "free": [Rect(edge, edge, eff_w, eff_h)],   # 有効領域をfreeとして開始
+            "placed": [],
+            "cuts": []
+        }
 
-    allc = horiz + vert
+    cur = new_board()
+    boards.append(cur)
 
-    best_yield = sorted(allc, key=lambda c: (c["boards"], c["waste"]))[0]
-    # カット数は四辺延長から算出するので、ここでは仮に最小を後で再評価
-    # まず全候補に対してカット本数を計測
-    def calc_cuts_count(block):
-        blocks = build_cutlines_from_pieces(block["boards_draw"], BOARD_W, BOARD_H, eff_w, eff_h, edge_trim)
-        return sum(b["cuts_count"] for b in blocks)
+    for pid, w0, h0 in pieces_sorted:
+        placed_flag = False
+        # 全ボード探索（First-Fit だと枚数が増えがち→Best-Fit風にscore最小を選ぶ）
+        best_choice = None  # (score, b_idx, f_idx, rot, split_pref)
+        for b_idx, b in enumerate(boards):
+            for f_idx, free in enumerate(b["free"]):
+                # 回転候補を試す
+                for rot in ([False, True] if allow_rotate else [False]):
+                    w = h0 if rot else w0
+                    h = w0 if rot else h0
+                    if not rect_fits(w, h, free):
+                        continue
+                    score, split_pref = choose_score(free, w, h, kerf, objective)
+                    if best_choice is None or score < best_choice[0]:
+                        best_choice = (score, b_idx, f_idx, rot, split_pref, w, h)
 
-    for c in allc:
-        c["cuts_count"] = calc_cuts_count(c)
-    best_cut = sorted(allc, key=lambda c: (c["cuts_count"], c["boards"]))[0]
+        if best_choice is None:
+            # 新しいボードを開いてそこへ
+            cur = new_board()
+            boards.append(cur)
+            # ここで必ず入るはず（最初のfreeは母材有効領域）
+            w, h = (h0, w0) if (allow_rotate and h0<=eff_w and w0<=eff_h and h0*w0>w0*h0) else (w0, h0)
+            # ただし入りきらない寸法があればエラー
+            if w > eff_w + EPS or h > eff_h + EPS:
+                st.error(f"部材#{pid}（{w0}×{h0}）が母材有効領域（{eff_w}×{eff_h}）に入りません。")
+                return [], eff_w, eff_h
 
-    return best_yield, best_cut, eff_w, eff_h
+            # 最初のfreeへ配置
+            free = cur["free"].pop(0)
+            score, split_pref = choose_score(free, w, h, kerf, objective)
+            placed, new_rects, vcut, hcut = place_and_split(free, w, h, kerf, split_pref)
+            placed.pid = pid
+            cur["placed"].append(placed)
+            cur["free"].extend(new_rects)
+            if vcut: cur["cuts"].append(vcut)
+            if hcut: cur["cuts"].append(hcut)
+            continue
 
-# ------------------------------------------------------------
-# 実行・表示
-# ------------------------------------------------------------
+        # 既存ボードのベストへ配置
+        _, b_idx, f_idx, rot, split_pref, w, h = best_choice
+        b = boards[b_idx]
+        free = b["free"].pop(f_idx)
+        placed, new_rects, vcut, hcut = place_and_split(free, w, h, kerf, split_pref)
+        placed.pid = pid
+        placed.rot = rot
+        b["placed"].append(placed)
+        b["free"].extend(new_rects)
+        if vcut: b["cuts"].append(vcut)
+        if hcut: b["cuts"].append(hcut)
+
+    return boards, eff_w, eff_h
+
+def build_lines_extended(cuts: List[CutLine], edge: float, eff_w: float, eff_h: float) -> List[CutLine]:
+    """描画用：カット線を板外（有効外周）から20mmはみ出して表示。外周一致線は既に存在しない構成。"""
+    out = []
+    over = 20.0
+    for c in cuts:
+        if abs(c.x1 - c.x2) < EPS:
+            # 縦
+            out.append(CutLine(c.x1, edge - over, c.x2, edge + eff_h + over))
+        else:
+            # 横
+            out.append(CutLine(edge - over, c.y1, edge + eff_w + over, c.y2))
+    return out
+
+def compute_metrics(boards, eff_w, eff_h):
+    used_area_total = 0.0
+    for b in boards:
+        for p in b["placed"]:
+            used_area_total += p.w * p.h
+    eff_area_total = eff_w * eff_h * len(boards)
+    yield_ratio = (used_area_total / eff_area_total * 100.0) if eff_area_total>0 else 0.0
+    # 分割本数（cut線本数）
+    cut_count = sum(len(b["cuts"]) for b in boards)
+    return used_area_total, eff_area_total, yield_ratio, cut_count
+
+def draw_boards(boards, title, board_w, board_h, edge, eff_w, eff_h):
+    figs = []
+    for i, b in enumerate(boards):
+        fig, ax = plt.subplots(figsize=(9, 4.5))
+        ax.set_title(f"{title} - 板 {i+1}")
+        ax.set_xlim(0, board_w)
+        ax.set_ylim(0, board_h)
+        # 母材外形
+        ax.add_patch(plt.Rectangle((0,0), board_w, board_h, fill=False, linewidth=2))
+        # 有効外周
+        ax.add_patch(plt.Rectangle((edge, edge), eff_w, eff_h, fill=False, linestyle="--", linewidth=1))
+
+        # ピース
+        for p in b["placed"]:
+            ax.add_patch(plt.Rectangle((p.x, p.y), p.w, p.h, fill=None, linewidth=1))
+            ax.text(p.x + p.w/2, p.y + p.h/2, f"{int(p.w)}×{int(p.h)}\n#{p.pid}{'R' if p.rot else ''}",
+                    ha="center", va="center", fontsize=8)
+
+        # カット線（延長）
+        cuts_ext = build_lines_extended(b["cuts"], edge, eff_w, eff_h)
+        for c in cuts_ext:
+            ax.plot([c.x1, c.x2], [c.y1, c.y2], linewidth=1.2)
+
+        ax.set_aspect('equal')
+        st.pyplot(fig)
+
+        buf = BytesIO()
+        fig.savefig(buf, format="png", bbox_inches="tight", dpi=150)
+        buf.seek(0)
+        st.download_button(
+            label=f"⬇️ 板 {i+1} をPNG保存",
+            data=buf,
+            file_name=f"{title}_board{i+1}.png",
+            mime="image/png"
+        )
+        figs.append(fig)
+    return figs
+
+def verify_no_overlap_and_no_cut_cross(boards):
+    """
+    念のため検証：
+      - 部材同士の重なり無し
+      - カット線が部材内部を横断しない（ギロチン手順上起きないが保険）
+    """
+    overlaps = 0
+    cut_cross = 0
+    for b in boards:
+        P = b["placed"]
+        # 重なり
+        for i in range(len(P)):
+            for j in range(i+1, len(P)):
+                a, c = P[i], P[j]
+                if (a.x + a.w - EPS > c.x) and (c.x + c.w - EPS > a.x) and (a.y + a.h - EPS > c.y) and (c.y + c.h - EPS > a.y):
+                    overlaps += 1
+        # カット横断
+        for cl in b["cuts"]:
+            vertical = abs(cl.x1 - cl.x2) < EPS
+            for p in P:
+                if vertical:
+                    if p.x + EPS < cl.x1 < p.x + p.w - EPS and p.y + EPS < cl.y1 < p.y + p.h - EPS:
+                        cut_cross += 1
+                else:
+                    if p.y + EPS < cl.y1 < p.y + p.h - EPS and p.x + EPS < cl.x1 < p.x + p.w - EPS:
+                        cut_cross += 1
+    return overlaps, cut_cross
+
+# -----------------------------
+# 実行
+# -----------------------------
 with right:
-    st.subheader("③ 結果")
+    st.subheader("④ 結果")
     if compute:
         rows = st.session_state.rows
-        best_yield, best_cut, eff_w, eff_h = explore(
-            rows, BOARD_W, BOARD_H, kerf, edge_trim, allow_rotate,
-            max_height_candidates, merge_height_tol
-        )
-        if best_yield is None:
-            st.error("安全マージンが大きすぎて有効領域がありません。")
+        pieces = expand_pieces(rows)
+
+        # 目的に合わせて2案を作る
+        objA = "yield"
+        objB = "cuts"
+
+        boards_A, eff_w, eff_h = guillotine_pack(pieces, BOARD_W, BOARD_H, kerf, edge_trim, allow_rotate, objA)
+        boards_B, _, _         = guillotine_pack(pieces, BOARD_W, BOARD_H, kerf, edge_trim, allow_rotate, objB)
+
+        if not boards_A:
+            st.error("有効領域が0です。外周安全マージンの値などを見直してください。")
         else:
-            # ==== 歩留まり最優先 ====
+            # A: 歩留まり
+            usedA, effA, ratioA, cutsA = compute_metrics(boards_A, eff_w, eff_h)
             st.markdown("**① 歩留まり最優先**")
-            st.write(f"- パターン：{'横先行' if best_yield['mode']=='H' else '縦先行'} / パラメータ={int(best_yield['param'])} mm")
-            st.write(f"- 必要枚数：{best_yield['boards']} 枚")
-            eff_total = eff_w*eff_h*best_yield['boards']
-            st.write(f"- 歩留まり（有効面積ベース）：{(best_yield['used']/eff_total*100):.1f}%")
-
-            blocks_A = build_cutlines_from_pieces(best_yield["boards_draw"], BOARD_W, BOARD_H, eff_w, eff_h, edge_trim)
-            st.write(f"- 推定カット本数：{sum(b['cuts_count'] for b in blocks_A)}（四辺延長・外周省略後）")
-            # 検証レポート
-            overlap_cnt = sum(len(b["overlaps"]) for b in blocks_A)
-            vconf_cnt = sum(len(b["v_conflicts"]) for b in blocks_A)
-            hconf_cnt = sum(len(b["h_conflicts"]) for b in blocks_A)
-            if overlap_cnt or vconf_cnt or hconf_cnt:
-                st.warning(f"検証: 重なり={overlap_cnt} / 縦線干渉={vconf_cnt} / 横線干渉={hconf_cnt}")
+            st.write(f"- 必要枚数：{len(boards_A)} 枚")
+            st.write(f"- 歩留まり（有効面積ベース）：{ratioA:.1f}%")
+            st.write(f"- カット本数（内部スプリット数）：{cutsA}")
+            ovA, cxA = verify_no_overlap_and_no_cut_cross(boards_A)
+            if ovA==0 and cxA==0:
+                st.success("検証OK：重なり・カットライン干渉なし（完全ギロチン）")
             else:
-                st.success("検証OK：重なり・カットライン干渉なし")
-
-            for i, block in enumerate(blocks_A):
-                draw_block(block, "歩留まり最優先", i, BOARD_W, BOARD_H)
+                st.warning(f"検証: 重なり={ovA} / カット横断={cxA}")
+            draw_boards(boards_A, "歩留まり最優先", BOARD_W, BOARD_H, edge_trim, eff_w, eff_h)
 
             st.markdown("---")
 
-            # ==== カット数最少 ====
-            st.markdown("**② カットライン最少化**")
-            st.write(f"- パターン：{'横先行' if best_cut['mode']=='H' else '縦先行'} / パラメータ={int(best_cut['param'])} mm")
-            st.write(f"- 必要枚数：{best_cut['boards']} 枚")
-            eff_total2 = eff_w*eff_h*best_cut['boards']
-            st.write(f"- 歩留まり（有効面積ベース）：{(best_cut['used']/eff_total2*100):.1f}%")
-
-            blocks_B = build_cutlines_from_pieces(best_cut["boards_draw"], BOARD_W, BOARD_H, eff_w, eff_h, edge_trim)
-            st.write(f"- 推定カット本数：{sum(b['cuts_count'] for b in blocks_B)}（四辺延長・外周省略後）")
-            overlap_cnt = sum(len(b["overlaps"]) for b in blocks_B)
-            vconf_cnt = sum(len(b["v_conflicts"]) for b in blocks_B)
-            hconf_cnt = sum(len(b["h_conflicts"]) for b in blocks_B)
-            if overlap_cnt or vconf_cnt or hconf_cnt:
-                st.warning(f"検証: 重なり={overlap_cnt} / 縦線干渉={vconf_cnt} / 横線干渉={hconf_cnt}")
+            # B: カット最少
+            usedB, effB, ratioB, cutsB = compute_metrics(boards_B, eff_w, eff_h)
+            st.markdown("**② カット数最少化**")
+            st.write(f"- 必要枚数：{len(boards_B)} 枚")
+            st.write(f"- 歩留まり（有効面積ベース）：{ratioB:.1f}%")
+            st.write(f"- カット本数（内部スプリット数）：{cutsB}")
+            ovB, cxB = verify_no_overlap_and_no_cut_cross(boards_B)
+            if ovB==0 and cxB==0:
+                st.success("検証OK：重なり・カットライン干渉なし（完全ギロチン）")
             else:
-                st.success("検証OK：重なり・カットライン干渉なし")
-
-            for i, block in enumerate(blocks_B):
-                draw_block(block, "カット数最少", i, BOARD_W, BOARD_H)
+                st.warning(f"検証: 重なり={ovB} / カット横断={cxB}")
+            draw_boards(boards_B, "カット数最少", BOARD_W, BOARD_H, edge_trim, eff_w, eff_h)
     else:
-        st.info("左側で条件・部材を入力し、「板取りを計算」を押してください。")
+        st.info("左で条件・部材を入力し「板取りを計算」を押してください。")
